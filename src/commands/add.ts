@@ -1,9 +1,10 @@
 import { execSync } from "child_process";
 import { mkdtempSync, rmSync, readdirSync, copyFileSync, mkdirSync, existsSync, statSync } from "fs";
 import { tmpdir } from "os";
-import { join, relative, dirname } from "path";
+import { join, relative, dirname, basename } from "path";
 
 const OWNER_REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+const GITHUB_URL_RE = /^https?:\/\/github\.com\/([a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+?)(?:\.git)?(?:\/.*)?$/;
 
 const SKILLS_DIRS = [
   ".claude/commands",
@@ -12,28 +13,23 @@ const SKILLS_DIRS = [
   "commands",
 ];
 
-function findSkillFiles(dir: string): string[] {
-  const files: string[] = [];
-
-  // First, check well-known skill directories
-  for (const skillDir of SKILLS_DIRS) {
-    const fullPath = join(dir, skillDir);
-    if (existsSync(fullPath) && statSync(fullPath).isDirectory()) {
-      files.push(...collectMarkdownFiles(fullPath, fullPath));
-    }
+function parseTarget(target: string): { owner: string; repo: string } {
+  // Try GitHub URL first
+  const urlMatch = target.match(GITHUB_URL_RE);
+  if (urlMatch) {
+    const [owner, repo] = urlMatch[1].split("/");
+    return { owner, repo };
   }
 
-  // If no files found in well-known dirs, look for .md files at root level
-  if (files.length === 0) {
-    const entries = readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isFile() && entry.name.endsWith(".md") && entry.name !== "README.md" && entry.name !== "LICENSE.md" && entry.name !== "CHANGELOG.md" && entry.name !== "CONTRIBUTING.md") {
-        files.push(entry.name);
-      }
-    }
+  // Try owner/repo format
+  if (OWNER_REPO_RE.test(target)) {
+    const [owner, repo] = target.split("/");
+    return { owner, repo };
   }
 
-  return files;
+  throw new Error(
+    `Invalid target '${target}'. Expected <owner/repo> or a GitHub URL.`
+  );
 }
 
 function collectMarkdownFiles(baseDir: string, currentDir: string): string[] {
@@ -52,30 +48,87 @@ function collectMarkdownFiles(baseDir: string, currentDir: string): string[] {
   return files;
 }
 
-function resolveSourceDir(repoDir: string): { sourceDir: string; relativeTo: string } {
+function findSkillFiles(dir: string): { sourceDir: string; files: string[] } {
+  // Check well-known skill directories
   for (const skillDir of SKILLS_DIRS) {
-    const fullPath = join(repoDir, skillDir);
+    const fullPath = join(dir, skillDir);
     if (existsSync(fullPath) && statSync(fullPath).isDirectory()) {
-      return { sourceDir: fullPath, relativeTo: skillDir };
+      const files = collectMarkdownFiles(fullPath, fullPath);
+      if (files.length > 0) {
+        return { sourceDir: fullPath, files };
+      }
     }
   }
-  return { sourceDir: repoDir, relativeTo: "" };
-}
 
-export async function add(target: string): Promise<void> {
-  if (!OWNER_REPO_RE.test(target)) {
-    throw new Error(
-      `Invalid format '${target}'. Expected <owner/repo> (e.g. anthropics/claude-skills).`
-    );
+  // Fall back to root-level markdown files
+  const entries = readdirSync(dir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (
+      entry.isFile() &&
+      entry.name.endsWith(".md") &&
+      !["README.md", "LICENSE.md", "CHANGELOG.md", "CONTRIBUTING.md"].includes(entry.name)
+    ) {
+      files.push(entry.name);
+    }
   }
 
-  const [owner, repo] = target.split("/");
+  return { sourceDir: dir, files };
+}
+
+function filterBySkill(sourceDir: string, files: string[], skillName: string): { filteredSourceDir: string; filteredFiles: string[] } {
+  // Strategy 1: Look for a subdirectory matching the skill name inside sourceDir
+  const skillSubDir = join(sourceDir, skillName);
+  if (existsSync(skillSubDir) && statSync(skillSubDir).isDirectory()) {
+    const subFiles = collectMarkdownFiles(skillSubDir, skillSubDir);
+    if (subFiles.length > 0) {
+      return { filteredSourceDir: skillSubDir, filteredFiles: subFiles };
+    }
+  }
+
+  // Strategy 2: Look for files whose path starts with the skill name (e.g. "shadcn-ui/foo.md")
+  const prefixMatch = files.filter(f => f.startsWith(skillName + "/") || f.startsWith(skillName + "\\"));
+  if (prefixMatch.length > 0) {
+    return { filteredSourceDir: sourceDir, filteredFiles: prefixMatch };
+  }
+
+  // Strategy 3: Look for a file named <skill>.md
+  const exactFile = files.filter(f => {
+    const base = basename(f, ".md");
+    return base === skillName;
+  });
+  if (exactFile.length > 0) {
+    return { filteredSourceDir: sourceDir, filteredFiles: exactFile };
+  }
+
+  // Strategy 4: Look for the skill name as a top-level directory in the repo root
+  // (in case sourceDir is a subdirectory like skills/)
+  const repoRoot = dirname(sourceDir);
+  const rootSkillDir = join(repoRoot, skillName);
+  if (existsSync(rootSkillDir) && statSync(rootSkillDir).isDirectory()) {
+    const subFiles = collectMarkdownFiles(rootSkillDir, rootSkillDir);
+    if (subFiles.length > 0) {
+      return { filteredSourceDir: rootSkillDir, filteredFiles: subFiles };
+    }
+  }
+
+  throw new Error(
+    `Skill '${skillName}' not found in repository. Available files: ${files.join(", ") || "(none)"}`
+  );
+}
+
+export async function add(target: string, skillName?: string): Promise<void> {
+  const { owner, repo } = parseTarget(target);
   const repoUrl = `https://github.com/${owner}/${repo}.git`;
-  const destDir = join(process.cwd(), ".claude", "commands");
+  const baseDestDir = join(process.cwd(), ".claude", "commands");
 
-  console.log(`Fetching skills from ${owner}/${repo}...`);
+  // Namespace: use skill name if provided, otherwise use repo name
+  const namespace = skillName || repo;
+  const destDir = join(baseDestDir, namespace);
 
-  // Clone to temp directory
+  const label = skillName ? `skill '${skillName}' from ${owner}/${repo}` : `skills from ${owner}/${repo}`;
+  console.log(`Fetching ${label}...`);
+
   const tmpDir = mkdtempSync(join(tmpdir(), "skills-"));
 
   try {
@@ -85,43 +138,44 @@ export async function add(target: string): Promise<void> {
       });
     } catch {
       throw new Error(
-        `Failed to clone repository '${target}'. Make sure the repository exists and is accessible.`
+        `Failed to clone repository '${owner}/${repo}'. Make sure the repository exists and is accessible.`
       );
     }
 
     const repoDir = join(tmpDir, "repo");
-    const skillFiles = findSkillFiles(repoDir);
+    let { sourceDir, files } = findSkillFiles(repoDir);
 
-    if (skillFiles.length === 0) {
+    if (files.length === 0) {
       throw new Error(
-        `No skill files (.md) found in '${target}'. ` +
+        `No skill files (.md) found in '${owner}/${repo}'. ` +
         `Expected markdown files in one of: ${SKILLS_DIRS.join(", ")} or at the repository root.`
       );
     }
 
-    // Determine the source directory
-    const { sourceDir } = resolveSourceDir(repoDir);
+    // If --skill is specified, narrow down to just that skill
+    if (skillName) {
+      const filtered = filterBySkill(sourceDir, files, skillName);
+      sourceDir = filtered.filteredSourceDir;
+      files = filtered.filteredFiles;
+    }
 
     // Ensure destination exists
     mkdirSync(destDir, { recursive: true });
 
     // Copy skill files
     let installed = 0;
-    for (const file of skillFiles) {
+    for (const file of files) {
       const srcPath = join(sourceDir, file);
       const destPath = join(destDir, file);
 
-      // Ensure subdirectory exists for nested skill files
       mkdirSync(dirname(destPath), { recursive: true });
-
       copyFileSync(srcPath, destPath);
       installed++;
       console.log(`  + ${file}`);
     }
 
-    console.log(`\nInstalled ${installed} skill(s) from ${owner}/${repo} into .claude/commands/`);
+    console.log(`\nInstalled ${installed} skill(s) from ${owner}/${repo} into .claude/commands/${namespace}/`);
   } finally {
-    // Clean up temp directory
     rmSync(tmpDir, { recursive: true, force: true });
   }
 }
