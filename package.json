@@ -1,0 +1,19 @@
+{
+  "name": "skills-sh",
+  "version": "1.0.0",
+  "description": "CLI tool to add Claude Code skills from GitHub repositories",
+  "main": "dist/index.js",
+  "bin": {
+    "skills": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["claude", "skills", "cli"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0"
+  }
+}
